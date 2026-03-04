@@ -10707,5 +10707,125 @@
         "expected": "<｜hy_begin▁of▁sentence｜><｜hy_User｜><｜hy_Assistant｜><｜hy_place▁holder▁no▁2｜><｜hy_place▁holder▁no▁8｜>"
       }
     ]
+  },
+  "google/translategemma-4b-it": {
+    "template": "{%- set languages = {\n    \"aa\": \"Afar\",\n    \"en\": \"English\",\n    \"zh\": \"Chinese\",\n    \"zh-Hans\": \"Chinese\",\n    \"zh-Hant\": \"Chinese\",\n    \"ja\": \"Japanese\",\n    \"ko\": \"Korean\",\n    \"fr\": \"French\",\n    \"de\": \"German\",\n    \"es\": \"Spanish\",\n    \"ru\": \"Russian\",\n    \"ar\": \"Arabic\",\n}\n-%}\n{{ bos_token }}\n{%- if (messages[0]['role'] \\!= 'user') -%}\n    {{ raise_exception(\"Conversations must start with a user prompt.\") }}\n{%- endif -%}\n{%- for message in messages -%}\n    {%- if (message['role'] == 'user') \\!= (loop.index0 % 2 == 0) -%}\n        {{ raise_exception(\"Conversation roles must alternate user/assistant/user/assistant/...\") }}\n    {%- endif -%}\n    {%- if (message['role'] == 'assistant') -%}\n        {%- if message['content'] is none or message['content'] is not string -%}\n            {{ raise_exception(\"Assistant role must provide content as a string\") }}\n        {%- endif -%}\n        {{ '<start_of_turn>model\n'}}\n        {{ message[\"content\"] | trim }}\n    {%- elif (message['role'] == 'user') -%}\n        {%- if message['content'] is none or message['content'] is not iterable or message['content'] | length \\!= 1 -%}\n            {{ raise_exception(\n                \"User role must provide content as an iterable with exactly one item.\"\n            ) }}\n        {%- endif -%}\n        {%- set content = message[\"content\"][0] -%}\n        {%- set source_lang_code = content[\"source_lang_code\"] | replace(\"_\", \"-\")  -%}\n        {%- set source_lang = languages[source_lang_code] -%}\n        {%- set target_lang_code = content[\"target_lang_code\"] | replace(\"_\", \"-\") -%}\n        {%- set target_lang = languages[target_lang_code] -%}\n        {{ '<start_of_turn>user\nYou are a professional ' + source_lang + ' (' + source_lang_code + ') to ' +\n           target_lang + ' (' + target_lang_code + ') translator. Your goal is to accurately convey the meaning and '\n           'nuances of the original ' + source_lang + ' text while adhering to ' + target_lang + ' grammar, '\n           'vocabulary, and cultural sensitivities.\n'\n        }}\n        {%- if content[\"type\"] == 'text' -%}\n            {{\n                'Produce only the ' + target_lang + ' translation, without any additional explanations or ' +\n                'commentary. Please translate the following ' + source_lang + ' text into ' + target_lang + ':\n\n\n' +\n                content[\"text\"] | trim\n            }}\n        {%- elif content[\"type\"] == 'image' -%}\n            {{\n                'Please translate the ' + source_lang + ' text in the provided image into ' + target_lang + '. ' +\n                'Produce only the ' + target_lang + ' translation, without any additional explanations, ' +\n                'alternatives or commentary. Focus only on the text, do not output where the text is located, ' +\n                'surrounding objects or any other explanation about the picture. Ignore symbols, pictogram, and ' +\n                'arrows\\!\n\n\n<start_of_image>'\n            }}\n        {%- else -%}\n            {{ raise_exception(\"User role content can contain either text or image data.\") }}\n        {%- endif -%}\n    {%- else -%}\n        {{ raise_exception(\"Conversations must only contain user or assistant roles.\") }}\n    {%- endif -%}\n    {{ '<end_of_turn>\n' }}\n{%- endfor -%}\n{%- if add_generation_prompt -%}\n    {{'<start_of_turn>model\n'}}\n{%- endif -%}\n",
+    "special_tokens": {
+      "bos_token": "<bos>",
+      "eos_token": "<eos>",
+      "unk_token": "<unk>",
+      "pad_token": "<pad>"
+    },
+    "cases": [
+      {
+        "description": "basic_en_to_zh_translation",
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "source_lang_code": "en",
+                "target_lang_code": "zh",
+                "text": "Hello, how are you?"
+              }
+            ]
+          }
+        ],
+        "add_generation_prompt": true,
+        "expected": "<bos><start_of_turn>user\nYou are a professional English (en) to Chinese (zh) translator. Your goal is to accurately convey the meaning and nuances of the original English text while adhering to Chinese grammar, vocabulary, and cultural sensitivities.\nProduce only the Chinese translation, without any additional explanations or commentary. Please translate the following English text into Chinese:\n\n\nHello, how are you?<end_of_turn>\n<start_of_turn>model\n"
+      },
+      {
+        "description": "en_to_ja_translation",
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "source_lang_code": "en",
+                "target_lang_code": "ja",
+                "text": "Good morning\\!"
+              }
+            ]
+          }
+        ],
+        "add_generation_prompt": true,
+        "expected": "<bos><start_of_turn>user\nYou are a professional English (en) to Japanese (ja) translator. Your goal is to accurately convey the meaning and nuances of the original English text while adhering to Japanese grammar, vocabulary, and cultural sensitivities.\nProduce only the Japanese translation, without any additional explanations or commentary. Please translate the following English text into Japanese:\n\n\nGood morning\\!<end_of_turn>\n<start_of_turn>model\n"
+      },
+      {
+        "description": "zh_to_en_translation",
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "source_lang_code": "zh-Hans",
+                "target_lang_code": "en",
+                "text": "你好，世界！"
+              }
+            ]
+          }
+        ],
+        "add_generation_prompt": true,
+        "expected": "<bos><start_of_turn>user\nYou are a professional Chinese (zh-Hans) to English (en) translator. Your goal is to accurately convey the meaning and nuances of the original Chinese text while adhering to English grammar, vocabulary, and cultural sensitivities.\nProduce only the English translation, without any additional explanations or commentary. Please translate the following Chinese text into English:\n\n\n你好，世界！<end_of_turn>\n<start_of_turn>model\n"
+      },
+      {
+        "description": "translation_with_assistant_response",
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "source_lang_code": "en",
+                "target_lang_code": "zh",
+                "text": "Thank you"
+              }
+            ]
+          },
+          {
+            "role": "assistant",
+            "content": "谢谢"
+          }
+        ],
+        "add_generation_prompt": false,
+        "expected": "<bos><start_of_turn>user\nYou are a professional English (en) to Chinese (zh) translator. Your goal is to accurately convey the meaning and nuances of the original English text while adhering to Chinese grammar, vocabulary, and cultural sensitivities.\nProduce only the Chinese translation, without any additional explanations or commentary. Please translate the following English text into Chinese:\n\n\nThank you<end_of_turn>\n<start_of_turn>model\n\n        谢谢<end_of_turn>\n"
+      },
+      {
+        "description": "multi_turn_translation",
+        "messages": [
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "source_lang_code": "en",
+                "target_lang_code": "zh",
+                "text": "Hello"
+              }
+            ]
+          },
+          {
+            "role": "assistant",
+            "content": "你好"
+          },
+          {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "source_lang_code": "en",
+                "target_lang_code": "zh",
+                "text": "Goodbye"
+              }
+            ]
+          }
+        ],
+        "add_generation_prompt": true,
+        "expected": "<bos><start_of_turn>user\nYou are a professional English (en) to Chinese (zh) translator. Your goal is to accurately convey the meaning and nuances of the original English text while adhering to Chinese grammar, vocabulary, and cultural sensitivities.\nProduce only the Chinese translation, without any additional explanations or commentary. Please translate the following English text into Chinese:\n\n\nHello<end_of_turn>\n<start_of_turn>model\n\n        你好<end_of_turn>\n<start_of_turn>user\nYou are a professional English (en) to Chinese (zh) translator. Your goal is to accurately convey the meaning and nuances of the original English text while adhering to Chinese grammar, vocabulary, and cultural sensitivities.\nProduce only the Chinese translation, without any additional explanations or commentary. Please translate the following English text into Chinese:\n\n\nGoodbye<end_of_turn>\n<start_of_turn>model\n"
+      }
+    ]
   }
 }

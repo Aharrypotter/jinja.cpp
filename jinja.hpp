@@ -1873,7 +1873,12 @@ private:
         }
 
         if (check(Token::String)) {
-            return make_unique<LiteralExpr>(advance().value);
+            // Support implicit string concatenation like Python: 'a' 'b' -> 'ab'
+            std::string result = advance().value;
+            while (check(Token::String)) {
+                result += advance().value;
+            }
+            return make_unique<LiteralExpr>(result);
         }
         if (check(Token::Identifier)) {
             std::string name = advance().value;
