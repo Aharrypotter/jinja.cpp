@@ -58,6 +58,8 @@ using UserFunction = std::function<json(const std::vector<Argument>&)>;
  * Designed specifically for LLM chat templates (HuggingFace style).
  * It supports a subset of Jinja2 syntax used in modern models.
  */
+struct StringPart;
+
 class Template {
 public:
     /**
@@ -85,6 +87,12 @@ public:
      * @brief Core rendering function.
      */
     inline std::string render(const json& context) const;
+
+    // Renders with every string under the context keys in `mark_keys` marked as
+    // input, and returns the output split into template-origin and
+    // input-origin parts. Throws if any context string already contains the
+    // reserved delimiters U+E000 / U+E001.
+    inline std::vector<StringPart> render_parts(const json& context, const std::vector<std::string>& mark_keys) const;
 
     /**
      * @brief Register a custom function.
@@ -153,9 +161,106 @@ inline std::string token_type_to_string(int type) {
     }
 }
 
+// ------------------------------------------------------------------------
+// Input marking. When Template::render_parts marks context values, every
+// string that came from those values carries U+E000 / U+E001 delimiters
+// around its bytes. String operations below treat the delimiters as
+// invisible and keep them attached to the bytes they came with, so the final
+// output can be split into template-origin and input-origin parts. Templates
+// rendered without marking never see a delimiter and behave exactly as before.
+namespace marks {
+static const std::string kOpen = "\xEE\x80\x80";   // U+E000
+static const std::string kClose = "\xEE\x80\x81";  // U+E001
+
+inline bool has(const std::string& s) { return s.find('\xEE') != std::string::npos && (s.find(kOpen) != std::string::npos || s.find(kClose) != std::string::npos); }
+
+// Text with a per-byte "came from input" flag.
+struct Text {
+    std::string text;
+    std::vector<bool> in;
+};
+
+inline Text decode(const std::string& raw) {
+    Text t;
+    if (!has(raw)) { t.text = raw; t.in.assign(raw.size(), false); return t; }
+    bool inside = false;
+    for (size_t i = 0; i < raw.size();) {
+        if (raw.compare(i, 3, kOpen) == 0) { inside = true; i += 3; continue; }
+        if (raw.compare(i, 3, kClose) == 0) { inside = false; i += 3; continue; }
+        t.text.push_back(raw[i]); t.in.push_back(inside); ++i;
+    }
+    return t;
+}
+
+inline std::string encode(const Text& t) {
+    std::string out;
+    bool inside = false;
+    for (size_t i = 0; i < t.text.size(); ++i) {
+        if (t.in[i] != inside) { out += t.in[i] ? kOpen : kClose; inside = t.in[i]; }
+        out.push_back(t.text[i]);
+    }
+    if (inside) out += kClose;
+    return out;
+}
+
+inline std::string strip(const std::string& raw) { return has(raw) ? decode(raw).text : raw; }
+
+// Slice [begin, end) of the decoded text, re-encoded.
+inline std::string slice(const Text& t, size_t begin, size_t end) {
+    Text s;
+    if (begin >= end) return "";
+    s.text = t.text.substr(begin, end - begin);
+    s.in.assign(t.in.begin() + begin, t.in.begin() + end);
+    return encode(s);
+}
+
+inline std::string mark_all(const std::string& s) { return s.empty() ? s : kOpen + s + kClose; }
+
+inline void mark_deep(json& v) {
+    if (v.is_string()) { v = json(mark_all(v.get<std::string>())); return; }
+    if (v.is_array()) { for (size_t i = 0; i < v.size(); ++i) { json e = v[i]; mark_deep(e); v[i] = e; } return; }
+    if (v.is_object()) { for (json::iterator it = v.begin(); it != v.end(); ++it) { json e = it.value(); mark_deep(e); v[it.key()] = e; } }
+}
+
+inline bool contains_delimiters_deep(const json& v) {
+    if (v.is_string()) return has(v.get<std::string>());
+    if (v.is_array()) { for (const auto& e : v) if (contains_delimiters_deep(e)) return true; return false; }
+    if (v.is_object()) { for (json::const_iterator it = v.begin(); it != v.end(); ++it) if (contains_delimiters_deep(it.value())) return true; }
+    return false;
+}
+
+// Equality that ignores marks on strings and inside containers.
+inline bool equal(const json& a, const json& b) {
+    if (a.is_string() && b.is_string()) return strip(a.get<std::string>()) == strip(b.get<std::string>());
+    if (a.is_array() && b.is_array()) {
+        if (a.size() != b.size()) return false;
+        for (size_t i = 0; i < a.size(); ++i) if (!equal(a[i], b[i])) return false;
+        return true;
+    }
+    return a == b;
+}
+}  // namespace marks
+
+struct StringPart {
+    std::string text;
+    bool is_input = false;
+};
+
+inline std::vector<StringPart> split_parts(const std::string& raw) {
+    std::vector<StringPart> parts;
+    const marks::Text t = marks::decode(raw);
+    for (size_t i = 0; i < t.text.size(); ++i) {
+        if (parts.empty() || parts.back().is_input != t.in[i]) parts.push_back({"", t.in[i]});
+        parts.back().text.push_back(t.text[i]);
+    }
+    return parts;
+}
+
 inline std::string to_python_repr(const json& val) {
     if (val.is_string()) {
-         std::string s = val.get<std::string>();
+         const std::string raw = val.get<std::string>();
+         const bool marked = marks::has(raw);
+         std::string s = marked ? marks::strip(raw) : raw;
          std::string out = "'";
          for (char c : s) {
              if (c == '\'') out += "\\'";
@@ -165,7 +270,7 @@ inline std::string to_python_repr(const json& val) {
              else out += c;
          }
          out += "'";
-         return out;
+         return marked ? marks::mark_all(out) : out;
     }
     return to_python_string(val);
 }
@@ -174,7 +279,11 @@ inline std::string to_json_string(const json& val, int indent = -1, int level = 
     if (val.is_null()) return "null";
     if (val.is_boolean()) return val.get<bool>() ? "true" : "false";
     if (val.is_number()) return val.dump();
-    if (val.is_string()) return val.dump();
+    if (val.is_string()) {
+        const std::string raw = val.get<std::string>();
+        if (!marks::has(raw)) return val.dump();
+        return marks::mark_all(json(marks::strip(raw)).dump());
+    }
 
     std::string nl = (indent >= 0) ? "\n" : "";
     std::string sp = (indent >= 0) ? std::string((level + 1) * indent, ' ') : "";
@@ -600,7 +709,7 @@ inline bool is_undefined(const json& val) {
 inline bool is_truthy(const json& val) {
     if (is_undefined(val)) return false;
     if (val.is_boolean()) return val.get<bool>();
-    if (val.is_string()) return !val.get<std::string>().empty();
+    if (val.is_string()) return !marks::strip(val.get<std::string>()).empty();
     if (val.is_number_integer()) return val.get<int64_t>() != 0;
     if (val.is_number_float()) return val.get<double>() != 0.0;
     if (val.is_array() || val.is_object()) return !val.empty();
@@ -823,7 +932,7 @@ struct GetItemExpr : Expr {
             }
         } else if (obj_val.is_object()) {
             if (key_val.is_string()) {
-                std::string k = key_val.get<std::string>();
+                std::string k = marks::strip(key_val.get<std::string>());
                 if (obj_val.contains(k)) return obj_val[k];
             }
         }
@@ -875,8 +984,8 @@ struct MethodCallExpr : Expr {
             } else if (method == "get") {
                 if (!args.empty()) {
                     json key = args[0]->evaluate(context);
-                    if (key.is_string() && obj_val.contains(key.get<std::string>())) {
-                        return json(obj_val[key.get<std::string>()].raw());
+                    if (key.is_string() && obj_val.contains(marks::strip(key.get<std::string>()))) {
+                        return json(obj_val[marks::strip(key.get<std::string>())].raw());
                     }
                     if (args.size() > 1) return args[1]->evaluate(context);
                 }
@@ -885,10 +994,11 @@ struct MethodCallExpr : Expr {
         }
 
         if (obj_val.is_string()) {
-            std::string s = obj_val.get<std::string>();
+            const marks::Text m = marks::decode(obj_val.get<std::string>());
+            const std::string& s = m.text;
             if (method == "startswith") {
                 if (!args.empty()) {
-                    std::string arg = args[0]->evaluate(context).get<std::string>();
+                    std::string arg = marks::strip(args[0]->evaluate(context).get<std::string>());
                     if (s.length() >= arg.length()) {
                         return (0 == s.compare(0, arg.length(), arg));
                     }
@@ -896,7 +1006,7 @@ struct MethodCallExpr : Expr {
                 }
             } else if (method == "endswith") {
                  if (!args.empty()) {
-                    std::string arg = args[0]->evaluate(context).get<std::string>();
+                    std::string arg = marks::strip(args[0]->evaluate(context).get<std::string>());
                     if (s.length() >= arg.length()) {
                         return (0 == s.compare(s.length() - arg.length(), arg.length(), arg));
                     }
@@ -904,48 +1014,46 @@ struct MethodCallExpr : Expr {
                 }
             } else if (method == "split") {
                  std::string delim = " ";
-                 if (!args.empty()) delim = args[0]->evaluate(context).get<std::string>();
+                 if (!args.empty()) delim = marks::strip(args[0]->evaluate(context).get<std::string>());
                  json arr = json::array();
                  size_t pos = 0;
-                 std::string token;
-                 // Simple split
                  size_t found = 0;
                  while ((found = s.find(delim, pos)) != std::string::npos) {
-                     arr.push_back(s.substr(pos, found - pos));
+                     arr.push_back(marks::slice(m, pos, found));
                      pos = found + delim.length();
                  }
-                 arr.push_back(s.substr(pos));
+                 arr.push_back(marks::slice(m, pos, s.size()));
                  return arr;
             } else if (method == "lstrip") {
-                // Simplified lstrip (whitespace or chars?)
-                // Python lstrip() removes whitespace, lstrip(chars) removes chars.
                  std::string chars = " \n\r\t";
-                 if (!args.empty()) chars = args[0]->evaluate(context).get<std::string>();
+                 if (!args.empty()) chars = marks::strip(args[0]->evaluate(context).get<std::string>());
                  size_t start = s.find_first_not_of(chars);
-                 return (start == std::string::npos) ? "" : s.substr(start);
+                 return (start == std::string::npos) ? "" : marks::slice(m, start, s.size());
             } else if (method == "rstrip") {
                  std::string chars = " \n\r\t";
-                 if (!args.empty()) chars = args[0]->evaluate(context).get<std::string>();
+                 if (!args.empty()) chars = marks::strip(args[0]->evaluate(context).get<std::string>());
                  size_t end = s.find_last_not_of(chars);
-                 return (end == std::string::npos) ? "" : s.substr(0, end + 1);
+                 return (end == std::string::npos) ? "" : marks::slice(m, 0, end + 1);
             } else if (method == "strip") {
                  std::string chars = " \n\r\t";
-                 if (!args.empty()) chars = args[0]->evaluate(context).get<std::string>();
+                 if (!args.empty()) chars = marks::strip(args[0]->evaluate(context).get<std::string>());
                  size_t start = s.find_first_not_of(chars);
                  if (start == std::string::npos) return "";
                  size_t end = s.find_last_not_of(chars);
-                 return s.substr(start, end - start + 1);
+                 return marks::slice(m, start, end + 1);
             } else if (method == "replace") {
                  if (args.size() >= 2) {
-                     std::string from = args[0]->evaluate(context).get<std::string>();
-                     std::string to = args[1]->evaluate(context).get<std::string>();
-                     std::string res = s;
-                     if (from.empty()) return res;
-                     size_t start_pos = 0;
-                     while((start_pos = res.find(from, start_pos)) != std::string::npos) {
-                         res.replace(start_pos, from.length(), to);
-                         start_pos += to.length();
+                     std::string from = marks::strip(args[0]->evaluate(context).get<std::string>());
+                     std::string to = args[1]->evaluate(context).get<std::string>();  // keeps its own marks
+                     if (from.empty()) return marks::encode(m);
+                     std::string res;
+                     size_t pos = 0, found = 0;
+                     while ((found = s.find(from, pos)) != std::string::npos) {
+                         res += marks::slice(m, pos, found);
+                         res += to;
+                         pos = found + from.length();
                      }
+                     res += marks::slice(m, pos, s.size());
                      return res;
                  }
             }
@@ -979,14 +1087,15 @@ struct FilterExpr : Expr {
             return to_python_string(val);
         } else if (name == "capitalize") {
              if (val.is_string()) {
-                 std::string s = val.get<std::string>();
+                 marks::Text m = marks::decode(val.get<std::string>());
+                 std::string& s = m.text;
                  if (!s.empty()) {
                      s[0] = std::toupper(s[0]);
                      for (size_t i = 1; i < s.length(); ++i) {
                          s[i] = std::tolower(s[i]);
                      }
                  }
-                 return s;
+                 return marks::encode(m);
              }
         } else if (name == "min" || name == "max") {
             if (val.is_array() && val.size() > 0) {
@@ -1001,17 +1110,16 @@ struct FilterExpr : Expr {
             return UNDEFINED;
         } else if (name == "length") {
             if (val.is_array() || val.is_object()) return val.size();
-            if (val.is_string()) return val.get<std::string>().length();
+            if (val.is_string()) return marks::strip(val.get<std::string>()).length();
             return 0;
         } else if (name == "trim") {
             if (val.is_string()) {
-                std::string s = val.get<std::string>();
-                // Trim logic from MethodCallExpr?
-                // Minimal trim:
+                const marks::Text m = marks::decode(val.get<std::string>());
+                const std::string& s = m.text;
                 auto start = s.find_first_not_of(" \n\r\t");
                 if (start == std::string::npos) return "";
                 auto end = s.find_last_not_of(" \n\r\t");
-                return s.substr(start, end - start + 1);
+                return marks::slice(m, start, end + 1);
             }
         } else if (name == "items") {
              if (val.is_object()) {
@@ -1027,17 +1135,17 @@ struct FilterExpr : Expr {
              return json::array();
         } else if (name == "lower") {
              if (val.is_string()) {
-                 std::string s = val.get<std::string>();
-                 std::transform(s.begin(), s.end(), s.begin(),
+                 marks::Text m = marks::decode(val.get<std::string>());
+                 std::transform(m.text.begin(), m.text.end(), m.text.begin(),
                                 [](unsigned char c){ return std::tolower(c); });
-                 return s;
+                 return marks::encode(m);
              }
         } else if (name == "upper") {
              if (val.is_string()) {
-                 std::string s = val.get<std::string>();
-                 std::transform(s.begin(), s.end(), s.begin(),
+                 marks::Text m = marks::decode(val.get<std::string>());
+                 std::transform(m.text.begin(), m.text.end(), m.text.begin(),
                                 [](unsigned char c){ return std::toupper(c); });
-                 return s;
+                 return marks::encode(m);
              }
         } else if (name == "map") {
              if (val.is_array()) {
@@ -1118,8 +1226,8 @@ struct BinaryExpr : Expr {
             }
         }
 
-        if (op == "==") return l == r;
-        if (op == "!=") return l != r;
+        if (op == "==") return marks::equal(l, r);
+        if (op == "!=") return !marks::equal(l, r);
         if (op == "<") return l < r;
         if (op == ">") return l > r;
         if (op == "<=") return l <= r;
@@ -1127,29 +1235,29 @@ struct BinaryExpr : Expr {
 
         if (op == "in") {
              if (r.is_array()) {
-                 for (const auto& el : r) if (el == l) return true;
+                 for (const auto& el : r) if (marks::equal(el, l)) return true;
                  return false;
              }
              if (r.is_object() && l.is_string()) {
-                 return r.contains(l.get<std::string>());
+                 return r.contains(marks::strip(l.get<std::string>()));
              }
              if (r.is_string() && l.is_string()) {
-                 return r.get<std::string>().find(l.get<std::string>()) != std::string::npos;
+                 return marks::strip(r.get<std::string>()).find(marks::strip(l.get<std::string>())) != std::string::npos;
              }
              return false;
         }
         if (op == "not in") {
              if (r.is_array()) {
                  for (const auto& el : r) {
-                     if (el == l) return false;
+                     if (marks::equal(el, l)) return false;
                  }
                  return true;
              }
              if (r.is_object() && l.is_string()) {
-                 return !r.contains(l.get<std::string>());
+                 return !r.contains(marks::strip(l.get<std::string>()));
              }
              if (r.is_string() && l.is_string()) {
-                 return r.get<std::string>().find(l.get<std::string>()) == std::string::npos;
+                 return marks::strip(r.get<std::string>()).find(marks::strip(l.get<std::string>())) == std::string::npos;
              }
              return true;
         }
@@ -1251,7 +1359,7 @@ struct ObjectExpr : Expr {
     json evaluate(Context& context) override {
         json obj = json::object();
         for (const auto& item : items) {
-             std::string key = item.first->evaluate(context).get<std::string>(); // Keys must be strings in JSON
+             std::string key = marks::strip(item.first->evaluate(context).get<std::string>()); // Keys must be strings in JSON
              obj[key] = item.second->evaluate(context);
         }
         return obj;
@@ -2241,7 +2349,32 @@ inline std::string Template::render(const json& context) const {
     for (const auto& node : m_impl->root_nodes) {
         node->render(ctx, output);
     }
-    return output;
+    // A context rendered without marking never contains delimiters; strip
+    // defensively so a marked value can never leak into plain output.
+    return marks::strip(output);
+}
+
+inline std::vector<StringPart> Template::render_parts(const json& context, const std::vector<std::string>& mark_keys) const {
+    if (marks::contains_delimiters_deep(context)) {
+        throw std::runtime_error("jinja: context strings must not contain the reserved code points U+E000 / U+E001");
+    }
+    json marked = json(context.raw());
+    for (const auto& key : mark_keys) {
+        if (!marked.is_object() || !marked.contains(key)) continue;
+        json value = marked[key];
+        marks::mark_deep(value);
+        marked[key] = value;
+    }
+    Context ctx(m_impl->default_context);
+    ctx.set_functions(&m_impl->functions);
+    if (!marked.empty()) {
+        ctx.push_scope(marked);
+    }
+    std::string output;
+    for (const auto& node : m_impl->root_nodes) {
+        node->render(ctx, output);
+    }
+    return split_parts(output);
 }
 
 inline void Template::add_function(const std::string& name, UserFunction func) {
