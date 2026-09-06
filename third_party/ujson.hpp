@@ -84,7 +84,7 @@ public:
                 std::string ks = v[0].get<std::string>();
                 k.SetString(ks.c_str(), static_cast<rapidjson::SizeType>(ks.length()), m_doc->GetAllocator());
                 rapidjson::Value val_copy;
-                val_copy.CopyFrom(*(v.m_val), m_doc->GetAllocator());
+                val_copy.CopyFrom(*(v[1].m_val), m_doc->GetAllocator());
                 m_val->AddMember(k, val_copy, m_doc->GetAllocator());
             }
         } else {
@@ -450,7 +450,7 @@ public:
         if (is_obj && init.size() > 0) {
             *m_val = nlohmann_json::object();
             for (const auto& v : init) {
-                (*m_val)[v[0].get<std::string>()] = *(v.m_val);
+                (*m_val)[v[0].get<std::string>()] = *(v[1].m_val);
             }
         } else {
             *m_val = nlohmann_json::array();
