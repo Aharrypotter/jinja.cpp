@@ -411,7 +411,11 @@ struct json_getter<std::vector<T>> {
 
 class json {
 public:
+#ifdef UJSON_USE_ORDERED_JSON
+    using nlohmann_json = nlohmann::ordered_json;
+#else
     using nlohmann_json = nlohmann::json;
+#endif
 
     // Constructors
     json() : m_doc(std::make_shared<nlohmann_json>()), m_val(m_doc.get()) {}

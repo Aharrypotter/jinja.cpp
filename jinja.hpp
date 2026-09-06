@@ -125,10 +125,14 @@ namespace jinja {
 
 
 // C++14 make_unique polyfill for C++11
+#if __cplusplus >= 201402L
+using std::make_unique;
+#else
 template<typename T, typename... Args>
 std::unique_ptr<T> make_unique(Args&&... args) {
     return std::unique_ptr<T>(new T(std::forward<Args>(args)...));
 }
+#endif
 
 inline std::string to_python_string(const json& val);
 
@@ -210,12 +214,16 @@ inline std::string to_json_string(const json& val, int indent = -1, int level = 
             return 100;
         };
 
+#ifndef JINJA_PRESERVE_JSON_OBJECT_ORDER
         std::sort(keys.begin(), keys.end(), [&](const std::string& a, const std::string& b){
             int pa = get_prio(a);
             int pb = get_prio(b);
             if (pa != pb) return pa < pb;
             return a < b;
         });
+#else
+        (void)get_prio;
+#endif
 
         bool first = true;
         for (const auto& key : keys) {
@@ -266,12 +274,16 @@ inline std::string to_python_string(const json& val) {
             return 100;
         };
 
+#ifndef JINJA_PRESERVE_JSON_OBJECT_ORDER
         std::sort(keys.begin(), keys.end(), [&](const std::string& a, const std::string& b){
             int pa = get_prio(a);
             int pb = get_prio(b);
             if (pa != pb) return pa < pb;
             return a < b;
         });
+#else
+        (void)get_prio;
+#endif
 
         bool first = true;
         for (const auto& key : keys) {
@@ -649,8 +661,11 @@ public:
     }
 
     void set(const std::string& name, json val) {
-        // Set in current scope
-        scopes.back()[name] = std::move(val);
+        // Set in current scope. Detach the value first: with an ordered
+        // (vector-backed) JSON document, inserting a key can reallocate the
+        // scope storage and invalidate a handle that still points into it.
+        json detached(val.raw());
+        scopes.back()[name] = std::move(detached);
     }
 
     // For modifying a variable in place (e.g. namespace), we rely on get() returning a reference.
@@ -1292,7 +1307,8 @@ struct SetNode : Node {
             if (auto* var = dynamic_cast<VarExpr*>(attr->object.get())) {
                  json obj = context.get(var->name);
                  if (!obj.is_null()) {
-                     obj[attr->name] = val;
+                     json detached(val.raw());
+                     obj[attr->name] = std::move(detached);
                  }
             }
         }
@@ -1328,7 +1344,9 @@ struct ForStmt : Node {
                 keys.push_back(it.key());
             }
             // Sort keys to be deterministic/consistent with map behavior
+#ifndef JINJA_PRESERVE_JSON_OBJECT_ORDER
             std::sort(keys.begin(), keys.end());
+#endif
             for (const auto& key : keys) items.push_back(key);
         }
 
