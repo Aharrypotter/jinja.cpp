@@ -841,6 +841,36 @@ struct MethodCallExpr : Expr {
     json evaluate(Context& context) override {
         json obj_val = object->evaluate(context);
 
+        if (obj_val.is_object()) {
+            if (method == "items") {
+                json arr = json::array();
+                for (json::const_iterator it = obj_val.begin(); it != obj_val.end(); ++it) {
+                    json pair = json::array();
+                    pair.push_back(it.key());
+                    pair.push_back(it.value());
+                    arr.push_back(pair);
+                }
+                return arr;
+            } else if (method == "keys") {
+                json arr = json::array();
+                for (json::const_iterator it = obj_val.begin(); it != obj_val.end(); ++it) arr.push_back(it.key());
+                return arr;
+            } else if (method == "values") {
+                json arr = json::array();
+                for (json::const_iterator it = obj_val.begin(); it != obj_val.end(); ++it) arr.push_back(it.value());
+                return arr;
+            } else if (method == "get") {
+                if (!args.empty()) {
+                    json key = args[0]->evaluate(context);
+                    if (key.is_string() && obj_val.contains(key.get<std::string>())) {
+                        return json(obj_val[key.get<std::string>()].raw());
+                    }
+                    if (args.size() > 1) return args[1]->evaluate(context);
+                }
+                return UNDEFINED;
+            }
+        }
+
         if (obj_val.is_string()) {
             std::string s = obj_val.get<std::string>();
             if (method == "startswith") {
@@ -945,6 +975,17 @@ struct FilterExpr : Expr {
                  }
                  return s;
              }
+        } else if (name == "min" || name == "max") {
+            if (val.is_array() && val.size() > 0) {
+                json best(val[0].raw());
+                for (size_t i = 1; i < val.size(); ++i) {
+                    json candidate(val[i].raw());
+                    const bool better = (name == "min") ? (candidate < best) : (candidate > best);
+                    if (better) best = candidate;
+                }
+                return best;
+            }
+            return UNDEFINED;
         } else if (name == "length") {
             if (val.is_array() || val.is_object()) return val.size();
             if (val.is_string()) return val.get<std::string>().length();
@@ -1275,7 +1316,7 @@ struct PrintNode : Node {
         json val = expr->evaluate(context);
         if (is_undefined(val)) return; // Print nothing
         if (val.is_string()) out += val.get<std::string>();
-        else out += val.dump();
+        else out += to_python_string(val); // Jinja2 prints str(value): None, True, {'a': 1}
     }
 };
 
@@ -1313,6 +1354,20 @@ struct SetNode : Node {
             }
         }
         // If target is tuple, not supported yet.
+    }
+};
+
+// {% set name %}...{% endset %}: captures the rendered body into a variable.
+struct BlockSetNode : Node {
+    std::string name;
+    std::vector<std::unique_ptr<Node>> body;
+
+    BlockSetNode(std::string n, std::vector<std::unique_ptr<Node>> b) : name(std::move(n)), body(std::move(b)) {}
+
+    void render(Context& context, std::string& out) override {
+        std::string captured;
+        for (const auto& node : body) node->render(context, captured);
+        context.set(name, json(captured));
     }
 };
 
@@ -1404,9 +1459,13 @@ struct ForStmt : Node {
              json loop_obj;
              loop_obj["index0"] = index;
              loop_obj["index"] = index + 1;
+             loop_obj["revindex0"] = len - index - 1;
+             loop_obj["revindex"] = len - index;
              loop_obj["first"] = (index == 0);
              loop_obj["last"] = (index == len - 1);
              loop_obj["length"] = len;
+             loop_obj["previtem"] = index > 0 ? filtered_items[index - 1] : UNDEFINED;
+             loop_obj["nextitem"] = index + 1 < len ? filtered_items[index + 1] : UNDEFINED;
              loop_scope["loop"] = loop_obj;
 
              context.push_scope(std::move(loop_scope));
@@ -1534,6 +1593,33 @@ private:
     std::unique_ptr<Node> parse_set() {
         // We consumed {% and 'set'
         std::unique_ptr<Expr> target = parse_expression();
+
+        if (check(Token::BlockEnd)) {
+            // Block assignment: {% set name %} body {% endset %}
+            advance(); // eat %}
+            std::string name;
+            if (auto* var = dynamic_cast<VarExpr*>(target.get())) name = var->name;
+            std::vector<std::unique_ptr<Node>> body;
+            while (!is_at_end()) {
+                if (check(Token::BlockStart) && m_cursor + 1 < m_tokens.size()
+                    && m_tokens[m_cursor + 1].type == Token::Identifier && m_tokens[m_cursor + 1].value == "endset") {
+                    advance(); // eat {%
+                    advance(); // eat endset
+                    if (check(Token::BlockEnd)) advance(); // eat %}
+                    break;
+                }
+                if (check(Token::Text)) {
+                    body.push_back(make_unique<TextNode>(advance().value));
+                } else if (check(Token::ExpressionStart)) {
+                    body.push_back(parse_print());
+                } else if (check(Token::BlockStart)) {
+                    body.push_back(parse_block());
+                } else {
+                    advance();
+                }
+            }
+            return make_unique<BlockSetNode>(std::move(name), std::move(body));
+        }
 
         if (check(Token::Operator) && peek().value == "=") {
             advance();
